@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlflow-model-lifecycle-lab"
+version = "0.1.0"
+description = "A reproducible local MLflow experiment tracking and model registry lab."
+requires-python = ">=3.11"
+dependencies = [
+    "mlflow>=3.0",
+    "scikit-learn>=1.5",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
