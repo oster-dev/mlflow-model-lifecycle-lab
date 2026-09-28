@@ -116,6 +116,8 @@ class EngagementTrainingFlow(FlowSpec):
     def evaluate(self):
         from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
+        from mlflow_lab.training import decide_quality_gate
+
         predictions = self.pipeline.predict(self.x_test)
         probabilities = self.pipeline.predict_proba(self.x_test)[:, 1]
 
@@ -123,8 +125,11 @@ class EngagementTrainingFlow(FlowSpec):
         self.f1 = f1_score(self.y_test, predictions)
         self.roc_auc = roc_auc_score(self.y_test, probabilities)
 
-        self.passed_quality_gate = self.roc_auc >= self.roc_auc_threshold
-        self.quality_gate_decision = "accepted" if self.passed_quality_gate else "rejected"
+        self.quality_gate_decision = decide_quality_gate(
+            roc_auc=self.roc_auc,
+            threshold=self.roc_auc_threshold,
+        )
+        self.passed_quality_gate = self.quality_gate_decision == "accepted"
         comparison = ">=" if self.passed_quality_gate else "<"
 
         print(

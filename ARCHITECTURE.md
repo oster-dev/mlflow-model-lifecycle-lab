@@ -1,182 +1,303 @@
-# Architecture
+# MLflow Model Lifecycle Lab — Architecture
 
-## Purpose
 
-`mlflow-model-lifecycle-lab` demonstrates a compact but complete local ML model lifecycle:
+This document describes the architecture, component responsibilities, and design decisions for the MLflow Model Lifecycle Lab.
 
-```text
-deterministic data split
-→ training pipeline
-→ tracked experiment run
-→ logged metrics and model artifact
-→ registered model version
-→ registry-based inference
-```
 
-The repository deliberately focuses on lifecycle traceability rather than model complexity.
+## Goals
 
-## System context
 
-```text
-Developer
-│
-├── starts local MLflow server
-│   ├── SQLite backend store
-│   └── local artifact store
-│
-├── runs scripts/train.py
-│   ├── loads deterministic sample data
-│   ├── trains a sklearn pipeline
-│   ├── logs run metadata to MLflow
-│   └── registers a model version
-│
-└── runs scripts/predict.py
-    ├── resolves an explicit Registry URI
-    ├── loads the serialized pipeline
-    └── runs inference on raw feature inputs
-```
+The project has three primary goals:
+
+
+1. **Learn and demonstrate MLflow** for experiment tracking, model logging, and model registry.
+2. **Learn and demonstrate Metaflow** for workflow orchestration, step-level execution, and quality-gate routing.
+3. **Implement a minimal but complete model lifecycle** with an explicit promotion policy:
+   - Train candidate
+   - Evaluate metrics
+   - Apply a quality-gate decision
+   - Register only accepted candidates in the MLflow Model Registry
+
+
+The repository is intentionally local-first: SQLite backend, local artifacts, and Metaflow local mode. This keeps the focus on concepts and contracts rather than infrastructure complexity.
+
 
 ## Components
 
-| Component | Responsibility |
-|---|---|
-| `scripts/train.py` | CLI boundary for experiment and model configuration |
-| `src/mlflow_lab/training.py` | Deterministic split, pipeline construction, training, evaluation, and MLflow logging |
-| `StandardScaler` | Learns feature scaling during training and applies the same transformation at inference |
-| `LogisticRegression` | Binary classification estimator |
-| `sklearn.pipeline.Pipeline` | Serializes preprocessing and classification as one artifact |
-| MLflow Tracking Server | Receives experiment metadata, parameters, metrics, tags, artifacts, and model registrations |
-| SQLite (`mlflow.db`) | Local metadata backend for MLflow experiments, runs, and Registry state |
-| Local artifact store (`mlartifacts/`) | Stores serialized model artifacts and MLflow model metadata |
-| MLflow Model Registry | Maintains `engagement-classifier` versions and links each version to its source run |
-| `scripts/predict.py` | Loads a specific Registry version and executes local inference |
-| `tests/test_training.py` | Verifies deterministic data split behavior |
 
-## Training flow
+### `src/mlflow_lab/training.py`
+
+
+Core training and evaluation logic:
+
+
+- `TrainingResult` dataclass:
+  - `run_id`, `accuracy`, `f1`, `roc_auc`
+- `load_training_data(test_size, random_state)`:
+  - Loads the scikit-learn breast cancer dataset.
+  - Performs a stratified train/test split with a fixed `random_state`.
+- `train_and_log(...)`:
+  - Creates or reuses an MLflow experiment.
+  - Trains a `StandardScaler → LogisticRegression` pipeline.
+  - Logs parameters, metrics, tags, model signature, and input example.
+  - Registers the model under a given name in the MLflow Model Registry.
+- `decide_quality_gate(roc_auc, threshold)`:
+  - Pure, testable function implementing the promotion policy.
+  - Returns `"accepted"` if `roc_auc >= threshold`, else `"rejected"`.
+  - Raises `ValueError` for inputs outside `[0.0, 1.0]`.
+
+
+This module has no direct Metaflow dependency. It can be used for direct MLflow training runs (e.g. `scripts/train.py`) or as a library inside Metaflow steps.
+
+
+### `flows/engagement_training_flow.py`
+
+
+Metaflow workflow that orchestrates the end-to-end training and quality-gate process:
+
+
+- Parameters:
+  - `c`, `max_iter`: LogisticRegression hyperparameters.
+  - `test_size`, `random_state`: Data split configuration.
+  - `roc_auc_threshold`: Quality-gate threshold.
+  - `experiment_name`, `model_name`: MLflow experiment and registry names.
+- Steps:
+  - `start`:
+    - Reads `MLFLOW_TRACKING_URI` from the environment.
+    - Logs configuration.
+  - `load_data`:
+    - Calls `load_training_data()` from `mlflow_lab.training`.
+    - Stores train/test splits and dataset metadata as artifacts.
+  - `train_candidate`:
+    - Trains the `StandardScaler → LogisticRegression` pipeline.
+  - `evaluate`:
+    - Computes `accuracy`, `f1`, and `roc_auc`.
+    - Calls `decide_quality_gate()` to determine the promotion decision.
+  - `quality_gate`:
+    - Routes the flow to `accepted` or `rejected` based on `quality_gate_decision`.
+  - `accepted`:
+    - Logs parameters, metrics, and tags to MLflow.
+    - Registers the model in the MLflow Model Registry.
+    - Tags the run with Metaflow flow name and run ID for cross-tool lineage.
+  - `rejected`:
+    - Records a rejection reason.
+    - Does not create an MLflow run or register a model version.
+  - `end`:
+    - Summarizes the run outcome.
+
+
+The flow enforces a clear separation: Metaflow controls execution and policy routing; MLflow records and registers accepted candidates.
+
+
+### `scripts/train.py`
+
+
+CLI for direct MLflow training runs without Metaflow:
+
+
+- Accepts command-line arguments for experiment name, model name, and hyperparameters.
+- Calls `train_and_log()` from `mlflow_lab.training`.
+- Prints the resulting `TrainingResult`.
+
+
+This script is useful for quick experiments and for comparing candidates directly in the MLflow UI.
+
+
+### `scripts/predict.py`
+
+
+CLI for local inference using a registered MLflow model:
+
+
+- Loads a specific model version from the MLflow Model Registry, e.g.:
+  ```python
+  model_uri = "models:/engagement-classifier/3"
+  ```
+- Constructs a small input example.
+- Runs inference and prints prediction and probability.
+
+
+The loaded artifact includes the full sklearn pipeline (scaler + classifier), so preprocessing is applied automatically.
+
+
+### `tests/test_training.py`
+
+
+Test suite for deterministic behavior and quality-gate policy:
+
+
+- Tests for deterministic data splitting:
+  - Same `random_state` and `test_size` produce identical splits.
+  - Split sizes are stable across runs.
+- Tests for `decide_quality_gate`:
+  - `roc_auc == threshold` → `"accepted"`
+  - `roc_auc > threshold` → `"accepted"`
+  - `roc_auc < threshold` → `"rejected"`
+  - Invalid inputs (outside `[0.0, 1.0]`) → `ValueError`
+
+
+These tests ensure that the promotion policy is explicit, testable, and stable.
+
+
+## Data Flow
+
 
 ```text
-1. CLI arguments
-   └── experiment name, model name, C, max iterations, split seed
-
-2. Data loading
-   └── sklearn breast cancer dataset
-
-3. Deterministic split
-   └── train_test_split(..., stratify=target, random_state=42)
-
-4. Pipeline training
-   └── StandardScaler → LogisticRegression
-
-5. Evaluation
-   └── accuracy, F1, ROC-AUC
-
-6. MLflow logging
-   ├── parameters
-   ├── metrics
-   ├── tags
-   ├── input example
-   ├── input/output signature
-   └── serialized pipeline artifact
-
-7. Registry registration
-   └── engagement-classifier version N
+Breast Cancer Dataset (scikit-learn)
+→ Deterministic stratified split (random_state=42, test_size=0.2)
+→ sklearn Pipeline (StandardScaler → LogisticRegression)
+→ Metaflow EngagementTrainingFlow
+   → train_candidate
+   → evaluate (accuracy, f1, roc_auc)
+   → quality_gate (decide_quality_gate)
+      → accepted → MLflow tracking + model registration
+      → rejected → rejection reason recorded; no registration
+→ MLflow Model Registry (engagement-classifier v1, v2, v3, v4, ...)
+→ scripts/predict.py loads models:/engagement-classifier/<version>
+→ Local inference with preprocessed input
 ```
 
-## Inference flow
 
-```text
-1. Construct an explicit Registry URI
-   └── models:/engagement-classifier/3
+## MLflow Backend
 
-2. Load the registered MLflow model
-   └── mlflow.sklearn.load_model(...)
 
-3. Provide raw tabular model features
-   └── no separate manual scaling
+- **Tracking Server:**
+  - Runs locally via `mlflow server`.
+  - Backend store: `sqlite:///mlflow.db`.
+  - Default artifact root: `./mlartifacts`.
+- **UI:**
+  - Accessible at `http://127.0.0.1:8080`.
+  - Shows experiments, runs, metrics, parameters, tags, and model versions.
+- **Model Registry:**
+  - Tracks versions of `engagement-classifier`.
+  - Each version is linked to a specific MLflow run.
+  - Accepted Metaflow runs include additional tags for Metaflow flow and run ID.
 
-4. Pipeline applies StandardScaler internally
-   └── transform input using training-time scaling statistics
 
-5. LogisticRegression returns prediction and probability
+## Metaflow Execution
+
+
+- **Mode:** Local execution with a local datastore (`.metaflow/`).
+- **Graph validation:**
+  - The flow graph can be validated without running:
+    ```bash
+    python flows/engagement_training_flow.py show
+    ```
+- **Artifacts:**
+  - Metaflow stores step artifacts and run metadata in `.metaflow/`.
+  - This directory is excluded from Git to avoid committing runtime state.
+
+
+## Quality Gate Contract
+
+
+The promotion decision is implemented as a pure function:
+
+
+```python
+def decide_quality_gate(roc_auc: float, threshold: float) -> str:
+    if not 0.0 <= roc_auc <= 1.0:
+        raise ValueError("roc_auc must be between 0.0 and 1.0")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between 0.0 and 1.0")
+
+    return "accepted" if roc_auc >= threshold else "rejected"
 ```
 
-## Data and model contracts
 
-The MLflow model is logged with:
+This function:
 
-- an **input example**: a small representative DataFrame sample;
-- a **model signature**: inferred input columns/types and model output schema.
+- Has no side effects.
+- Does not depend on MLflow or Metaflow.
+- Is fully covered by unit tests in `tests/test_training.py`.
 
-Together, they document what the registered model expects at inference time. This is a lightweight local form of a serving contract.
 
-## Design decisions
+The Metaflow flow calls this function in the `evaluate` step and routes based on its result.
 
-### DD-001: Local MLflow server with SQLite
 
-**Decision:** Use a local MLflow server backed by SQLite and a local artifact root.
+## Lineage
 
-**Why:** The setup is free, easy to inspect, persistent across terminal sessions, and sufficient for understanding the relationship between tracking, artifacts, and registry state.
 
-**Trade-off:** It is not appropriate for shared, highly available, multi-user production use.
+The project maintains bidirectional lineage between Metaflow and MLflow:
 
-### DD-002: Pipeline instead of separate preprocessing
 
-**Decision:** Serialize `StandardScaler` and `LogisticRegression` together as one sklearn `Pipeline`.
+- **MLflow → Metaflow:**
+  - Accepted runs include tags:
+    - `orchestrator = metaflow`
+    - `metaflow_flow = EngagementTrainingFlow`
+    - `metaflow_run_id = <run ID>`
+    - `decision = accepted`
+- **Metaflow → MLflow:**
+  - The `accepted` step logs the MLflow run ID and model URI as artifacts.
+  - The `rejected` step records the rejection reason.
 
-**Why:** The same preprocessing learned during training is automatically applied during inference. This removes a common source of training-serving skew.
 
-**Trade-off:** Individual pipeline steps are less independently deployable, which is acceptable for this compact local lab.
+This makes it possible to trace every registered model version back to:
 
-### DD-003: Explicit model versions
+- A specific MLflow run.
+- A specific Metaflow flow execution.
+- A specific code version (Git commit).
 
-**Decision:** Load explicit Registry versions such as `models:/engagement-classifier/3`.
 
-**Why:** Explicit versions make the selected model deterministic and auditable. A caller can connect an inference result to a specific tracked run.
+## Design Decisions
 
-**Trade-off:** Promotion aliases or environment-aware deployment stages would be more convenient later, but they are intentionally out of scope for the initial local workflow.
 
-### DD-004: Deterministic split
+### Local-first development
 
-**Decision:** Use a stratified train/test split with a fixed random seed.
 
-**Why:** Re-running an unchanged configuration produces comparable training and evaluation conditions.
+- SQLite and local artifacts keep the setup simple and inspectable.
+- No cloud dependencies for learning and portfolio purposes.
+- Easy to extend later with cloud storage, managed databases, and remote compute.
 
-**Trade-off:** A real production evaluation design would include cross-validation, time-aware splits where appropriate, drift checks, and a held-out test strategy.
 
-## Model evolution evidence
+### Single metric threshold
 
-| Version | Change | Accuracy | F1 | ROC-AUC | Observation |
-|---:|---|---:|---:|---:|---|
-| v1 | Logistic Regression, `C=0.1` | 0.9474 | 0.9583 | 0.9937 | Convergence warning observed |
-| v2 | Logistic Regression, `C=1.0` | 0.9561 | 0.9655 | 0.9954 | Better metrics, warning remained |
-| v3 | `StandardScaler → LogisticRegression`, `C=1.0` | 0.9825 | 0.9861 | 0.9954 | Warning resolved; pipeline artifact created |
 
-The metrics above are local reference evidence for the documented configuration. They should not be interpreted as a general benchmark.
+- The quality gate currently uses only ROC-AUC.
+- This keeps the policy simple and easy to understand.
+- Future extensions could add multi-metric rules (e.g. minimum F1, maximum calibration error).
 
-## Production evolution path
 
-```text
-Local lab
-→ Metaflow workflow orchestration
-→ quality gate and candidate promotion policy
-→ CI validation
-→ remote tracking server
-→ object storage for artifacts
-→ managed relational backend
-→ access control and deployment environment separation
-→ monitoring, drift detection, and rollback policy
-```
+### Pipeline serialization
 
-## Non-goals
 
-The current scope does not include:
+- The sklearn pipeline (scaler + classifier) is logged as a single artifact.
+- This prevents training-serving skew: inference uses the same preprocessing as training.
+- The model signature and input example document the expected input format.
 
-- distributed model training;
-- cloud deployment;
-- real-time serving endpoint;
-- automated production promotion;
-- role-based access control;
-- monitoring or drift detection;
-- a production data source.
 
-These are intentionally deferred to preserve a focused, reproducible lifecycle foundation.
+### Explicit promotion policy
+
+
+- Model promotion is not automatic.
+- The quality gate enforces an explicit rule before registry entry.
+- Rejected candidates complete their workflow but do not create registry versions.
+
+
+## Current Limitations
+
+
+- No CI pipeline yet (formatting, linting, tests, flow validation).
+- No remote authentication or RBAC for the MLflow server.
+- No automated deployment or staging policy.
+- No model monitoring, drift detection, or rollback logic.
+- Dataset is a small built-in scikit-learn dataset for fast iteration.
+
+
+These limitations are intentional for this learning lab. They define clear next steps for future iterations.
+
+
+## Next Steps
+
+
+Potential extensions:
+
+
+- Add GitHub Actions CI for:
+  - Formatting and linting.
+  - Unit and integration tests.
+  - Metaflow graph validation.
+- Extend the promotion policy to multiple metrics and explicit approval rules.
+- Replace local storage with cloud object storage and a managed metadata backend.
+- Run Metaflow with remote compute and scheduled execution.
+- Add deployment automation, model monitoring, drift detection, and rollback policy.

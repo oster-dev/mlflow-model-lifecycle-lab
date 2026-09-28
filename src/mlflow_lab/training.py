@@ -32,6 +32,17 @@ def load_training_data(test_size: float, random_state: int):
     )
 
 
+def decide_quality_gate(roc_auc: float, threshold: float) -> str:
+    """Return the model-promotion decision for a validated ROC-AUC value."""
+    if not 0.0 <= roc_auc <= 1.0:
+        raise ValueError("roc_auc must be between 0.0 and 1.0")
+
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between 0.0 and 1.0")
+
+    return "accepted" if roc_auc >= threshold else "rejected"
+
+
 def train_and_log(
     *,
     experiment_name: str,
