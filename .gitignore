@@ -9,5 +9,6 @@ build/
 mlflow.db
 mlruns/
 mlartifacts/
+.metaflow/
 data/
 output/
